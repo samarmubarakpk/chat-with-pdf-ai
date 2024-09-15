@@ -1,28 +1,27 @@
 import streamlit as st
 import os
 import time
-from langchain_groq import ChatGroq
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.vectorstores import FAISS
+from langchain.document_loaders import PyPDFDirectoryLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.prompts import ChatPromptTemplate
 from langchain.chains import create_retrieval_chain
-from langchain_community.vectorstores import FAISS
-from langchain_community.document_loaders import PyPDFDirectoryLoader
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain.prompts import ChatPromptTemplate
+from langchain.chat_models import ChatOpenAI
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 
-# Load the GROQ and Google API keys
-groq_api_key = os.getenv('GROQ_API_KEY')
-google_api_key = os.getenv('GOOGLE_API_KEY')
-os.environ["GOOGLE_API_KEY"] = google_api_key
+# Directly assign the OpenAI API key
+openai_api_key = ''
+os.environ["OPENAI_API_KEY"] = openai_api_key
 
-st.title("Gemma Model Document Q&A")
+st.title("One Identity installation help")
 
-# Initialize the language model
-llm = ChatGroq(groq_api_key=groq_api_key, model_name="Llama3-8b-8192")
+# Initialize the language model with OpenAI
+llm = ChatOpenAI(api_key=openai_api_key, model_name="gpt-4")
 
 prompt = ChatPromptTemplate.from_template(
     """
@@ -38,11 +37,12 @@ prompt = ChatPromptTemplate.from_template(
 @st.cache_resource(show_spinner=False)
 def vector_embedding():
     try:
-        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+        # Use OpenAI Embeddings instead of Google embeddings
+        embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
         loader = PyPDFDirectoryLoader("./encoder_decoder")  # Data Ingestion
         docs = loader.load()  # Document Loading
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)  # Chunk Creation
-        final_documents = text_splitter.split_documents(docs[:20])  # Splitting
+        final_documents = text_splitter.split_documents(docs[:150])  # Splitting
         vectors = FAISS.from_documents(final_documents, embeddings)  # Vector embeddings
         return vectors
     except Exception as e:
@@ -70,7 +70,6 @@ if prompt1 and "vectors" in st.session_state:
 
         # With a Streamlit expander
         with st.expander("Document Similarity Search"):
-            # Find the relevant chunks
             for i, doc in enumerate(response["context"]):
                 st.write(doc.page_content)
                 st.write("--------------------------------")
