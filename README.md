@@ -28,7 +28,7 @@ Clone the Repository:
 
 bash
 Copy code
-git clone https://github.com/yourusername/chat-with-pdf-ai.git
+git clone (https://github.com/samarmubarakpk/chat-with-pdf-ai)
 cd chat-with-pdf-ai
 Setup the Environment:
 
