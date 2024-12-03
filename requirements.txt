@@ -9,3 +9,7 @@ langchain_community
 python-dotenv
 pypdf
 google-cloud-aiplatform>=1.38
+pyttsx3
+googletrans
+openai
+deep-translator
