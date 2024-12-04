@@ -67,11 +67,7 @@ faiss
 Project Structure
 bash
 Copy code
-.
-├── main.py                   # Main application logic
-├── requirements.txt          # List of dependencies
-├── README.md                 # Project description
-└── .venv/                    # Virtual environment (optional)
+
 Planned Features
 Integration with cloud-based vector databases.
 Enhanced multi-document querying.
