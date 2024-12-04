@@ -1,4 +1,5 @@
 Chat with PDF AI - README
+![Video GIF](sample.gif)
 Overview
 The Chat with PDF AI project is an interactive AI-powered tool that enables users to upload PDFs and extract insights using advanced Natural Language Processing (NLP) techniques. By embedding the contents of uploaded PDFs into a vector database, the tool allows users to query documents with natural language and receive accurate, contextually relevant responses.
 
