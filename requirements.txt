@@ -13,3 +13,6 @@ pyttsx3
 googletrans
 openai
 deep-translator
+fitz
+PyMuPDF
+anthropic
