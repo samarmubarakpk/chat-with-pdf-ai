@@ -11,29 +11,20 @@ from dotenv import load_dotenv
 import anthropic
 import hashlib
 
-# Load environment variables
-load_dotenv()
-
-# Set up Anthropic API key
-anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
-if not anthropic_api_key:
-    anthropic_api_key = st.sidebar.text_input("Enter your Anthropic API Key", type="password")
-
-# Initialize Anthropic client
-anthropic_client = None
-if anthropic_api_key:
-    try:
-        anthropic_client = anthropic.Anthropic(api_key=anthropic_api_key)
-    except Exception as e:
-        st.error(f"Error initializing Anthropic client: {str(e)}")
-
-# Set page configuration
+# Set page configuration - MUST COME FIRST
 st.set_page_config(
     page_title="PDF Q&A Assistant with Claude",
     page_icon="📚",
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# Load environment variables
+load_dotenv()
+
+# Set up Anthropic API key
+anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
+anthropic_client = None
 
 # Create Session State variables
 if 'extracted_text' not in st.session_state:
@@ -43,8 +34,28 @@ if 'pdf_images' not in st.session_state:
 if 'chat_history' not in st.session_state:
     st.session_state.chat_history = []
 
-# Key improvements for image handling in the PDF analyzer
+# Main App Title
+st.title("📚 PDF Q&A Assistant with Claude")
 
+# Now handle the API key in sidebar
+with st.sidebar:
+    st.header("Upload PDFs")
+    
+    # Request API key if not in environment
+    if not anthropic_api_key:
+        anthropic_api_key = st.text_input("Enter your Anthropic API Key", type="password")
+
+    # Initialize Anthropic client
+    if anthropic_api_key:
+        try:
+            anthropic_client = anthropic.Anthropic(api_key=anthropic_api_key)
+            st.success("✅ Anthropic API key loaded successfully")
+        except Exception as e:
+            st.error(f"Error initializing Anthropic client: {str(e)}")
+    else:
+        st.error("❌ Anthropic API key not configured or invalid")
+
+# The rest of your application functions and UI elements...
 def extract_images_and_text(pdf_files):
     """Extract both text and images from PDF files with improved image deduplication"""
     all_text = ""
@@ -461,51 +472,8 @@ Give comprehensive, accurate answers based only on the PDF context. When in doub
     except Exception as e:
         return f"Error querying Claude: {str(e)}"
 
-def display_single_image(img_ref, context=None, chart_type=None):
-    """Helper function to display a single image with appropriate caption"""
-    if img_ref in st.session_state.pdf_images:
-        img_bytes = st.session_state.pdf_images[img_ref]
-        try:
-            image = Image.open(io.BytesIO(img_bytes))
-            
-            # Determine appropriate caption
-            if chart_type == "price_chart":
-                caption = f"Technical Price Chart: {img_ref}"
-            elif chart_type == "momentum":
-                caption = f"Momentum Indicator: {img_ref}"
-            elif chart_type == "recommendation":
-                caption = f"Recommendation Summary: {img_ref}"
-            else:
-                # Auto-detect based on image reference and context
-                if "page_2_img_1" in img_ref:
-                    caption = f"Technical Price Chart: {img_ref}"
-                elif "momentum" in str(context).lower() and "page_2_" in img_ref:
-                    caption = f"Momentum Indicator: {img_ref}"
-                else:
-                    caption = f"Visualization: {img_ref}"
-            
-            # Display the image
-            st.image(image, caption=caption, use_container_width=True)
-            
-            # No expandable view to avoid duplication issues
-            return True
-        except Exception as e:
-            st.error(f"Could not display image {img_ref}: {str(e)}")
-            return False
-    return False
-
-# Main App UI
-st.title("📚 PDF Q&A Assistant with Claude")
-
+# Continue with the sidebar UI
 with st.sidebar:
-    st.header("Upload PDFs")
-    
-    # Display API key status
-    if anthropic_client:
-        st.success("✅ Anthropic API key loaded successfully")
-    else:
-        st.error("❌ Anthropic API key not configured or invalid")
-    
     # File uploader that accepts multiple PDFs
     uploaded_files = st.file_uploader(
         "Upload one or more PDF files (up to 500MB each)",
