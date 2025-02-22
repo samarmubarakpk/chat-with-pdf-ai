@@ -1,497 +1,452 @@
 import streamlit as st
 import os
+import time
 import tempfile
 from PyPDF2 import PdfReader
 import fitz  # PyMuPDF
-import base64
 from PIL import Image
 import io
 import re
+import base64
+import hashlib
 from dotenv import load_dotenv
 import anthropic
-import hashlib
+from sentence_transformers import SentenceTransformer
+import faiss
+import numpy as np
+import pickle
 
-# Set page configuration - MUST COME FIRST
+# Load environment variables
+load_dotenv()
+
+# Page configuration
 st.set_page_config(
-    page_title="PDF Q&A Assistant with Claude",
+    page_title="PDF Q&A with Vector Search",
     page_icon="📚",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Load environment variables
-load_dotenv()
-
-# Set up Anthropic API key
-anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
-anthropic_client = None
-
-# Create Session State variables
+# Initialize session state
 if 'extracted_text' not in st.session_state:
     st.session_state.extracted_text = ""
 if 'pdf_images' not in st.session_state:
     st.session_state.pdf_images = {}
 if 'chat_history' not in st.session_state:
     st.session_state.chat_history = []
+if 'embedding_model' not in st.session_state:
+    st.session_state.embedding_model = None
+if 'vector_index' not in st.session_state:
+    st.session_state.vector_index = None
+if 'chunk_mapping' not in st.session_state:
+    st.session_state.chunk_mapping = {}
+if 'token_usage' not in st.session_state:
+    st.session_state.token_usage = 0
 
-# Main App Title
-st.title("📚 PDF Q&A Assistant with Claude")
 
-# Now handle the API key in sidebar
-with st.sidebar:
-    st.header("Upload PDFs")
-    
-    # Request API key if not in environment
-    if not anthropic_api_key:
-        anthropic_api_key = st.text_input("Enter your Anthropic API Key", type="password")
+# At the start of your app, add this function
+def load_existing_vector_database():
+    """Try to load existing vector database if available"""
+    try:
+        if os.path.exists("vector_db/pdf_index.faiss") and os.path.exists("vector_db/chunk_mapping.pkl"):
+            # Load FAISS index
+            index = faiss.read_index("vector_db/pdf_index.faiss")
+            
+            # Load chunk mapping
+            with open("vector_db/chunk_mapping.pkl", "rb") as f:
+                chunk_mapping = pickle.load(f)
+            
+            # Store in session state
+            st.session_state.vector_index = index
+            st.session_state.chunk_mapping = chunk_mapping
+            
+            # Initialize embedding model
+            if not st.session_state.embedding_model:
+                initialize_embedding_model()
+            
+            return True
+    except Exception as e:
+        st.error(f"Error loading vector database: {str(e)}")
+    return False
 
-    # Initialize Anthropic client
-    if anthropic_api_key:
-        try:
-            anthropic_client = anthropic.Anthropic(api_key=anthropic_api_key)
-            st.success("✅ Anthropic API key loaded successfully")
-        except Exception as e:
-            st.error(f"Error initializing Anthropic client: {str(e)}")
-    else:
-        st.error("❌ Anthropic API key not configured or invalid")
 
-# The rest of your application functions and UI elements...
-def extract_images_and_text(pdf_files):
-    """Extract both text and images from PDF files with improved image deduplication"""
+def initialize_embedding_model():
+    """Initialize the sentence transformer model for embeddings"""
+    if st.session_state.embedding_model is None:
+        with st.spinner("Loading embedding model..."):
+            # Use a smaller model for efficiency
+            st.session_state.embedding_model = SentenceTransformer('all-mpnet-base-v2')
+            # Financial/business oriented model
+            # st.session_state.embedding_model = SentenceTransformer('finbert-finance-sentiment') 
+            # st.session_state.embedding_model = SentenceTransformer('multi-qa-mpnet-base-dot-v1')  # Better for Q&A
+
+
+
+
+            return True
+    return True
+
+
+def extract_text_and_images(pdf_files, chunk_size=500, chunk_overlap=200):
+    """Extract text and images from PDFs and create chunks with metadata"""
     all_text = ""
     all_images = {}
-    image_hashes = {}  # Store image hashes to detect duplicates
+    chunks = []
+    chunk_metadata = []
+    image_hashes = set()
     
-    for i, pdf_file in enumerate(pdf_files):
+    for pdf_idx, pdf_file in enumerate(pdf_files):
+        pdf_num = pdf_idx + 1
+        doc = None
+        pdf_path = None
+        
         try:
             # Save uploaded file to temporary location
             with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
                 tmp_file.write(pdf_file.getvalue())
                 pdf_path = tmp_file.name
             
-            # Extract text with PyPDF2
-            pdf_reader = PdfReader(pdf_path)
-            for page_num, page in enumerate(pdf_reader.pages):
-                page_text = page.extract_text()
+            # Extract images with PyMuPDF
+            try:
+                doc = fitz.open(pdf_path)
+            except Exception as e:
+                st.error(f"Error opening PDF {pdf_num} with PyMuPDF: {str(e)}")
+                continue
+                
+            try:
+                pdf_reader = PdfReader(pdf_path)
+            except Exception as e:
+                st.error(f"Error opening PDF {pdf_num} with PyPDF2: {str(e)}")
+                continue
+            
+            for page_idx, page in enumerate(pdf_reader.pages):
+                page_num = page_idx + 1
+                
+                try:
+                    # Extract text
+                    page_text = page.extract_text() or ""
+                except Exception as e:
+                    st.warning(f"Could not extract text from PDF {pdf_num}, Page {page_num}: {str(e)}")
+                    page_text = ""
+                
+                # Add to complete text (for display purposes)
                 if page_text:
-                    all_text += f"\n\n--- PDF {i+1}, PAGE {page_num+1} ---\n{page_text}"
-            
-            # Enhanced image extraction with PyMuPDF
-            doc = fitz.open(pdf_path)
-            for page_num in range(len(doc)):
-                page = doc.load_page(page_num)
+                    all_text += f"\n\n--- PDF {pdf_num}, PAGE {page_num} ---\n{page_text}"
                 
-                # Method 1: Extract normal images with deduplication
-                image_list = page.get_images(full=True)
-                has_embedded_images = False
+                # Process images on this page
+                page_images = []
+                try:
+                    pymupdf_page = doc.load_page(page_idx)
+                    
+                    # Get images
+                    image_list = pymupdf_page.get_images(full=True)
+                    for img_idx, img in enumerate(image_list):
+                        try:
+                            xref = img[0]
+                            base_image = doc.extract_image(xref)
+                            image_bytes = base_image["image"]
+                            
+                            # Check for duplicates using hash
+                            img_hash = hashlib.md5(image_bytes).hexdigest()
+                            if img_hash in image_hashes:
+                                continue
+                            
+                            image_hashes.add(img_hash)
+                            image_key = f"pdf_{pdf_num}_page_{page_num}_img_{img_idx+1}"
+                            all_images[image_key] = image_bytes
+                            page_images.append(image_key)
+                        except Exception as e:
+                            st.warning(f"Failed to extract image {img_idx+1} from PDF {pdf_num}, Page {page_num}: {str(e)}")
+                    
+                    # If no embedded images, try to render page as image with error handling
+                    if not image_list:
+                        try:
+                            # Increase DPI and add white background
+                            zoom = 2  # higher zoom for better quality
+                            mat = fitz.Matrix(zoom, zoom)
+                            pix = pymupdf_page.get_pixmap(matrix=mat, alpha=False)
+                            
+                            if pix.width > 0 and pix.height > 0 and len(pix.samples) > 0:
+                                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                                img_byte_arr = io.BytesIO()
+                                img.save(img_byte_arr, format='JPEG', quality=85)
+                                rendered_bytes = img_byte_arr.getvalue()
+                                
+                                if len(rendered_bytes) > 0:  # Verify we got valid image data
+                                    render_hash = hashlib.md5(rendered_bytes).hexdigest()
+                                    if render_hash not in image_hashes:
+                                        image_hashes.add(render_hash)
+                                        image_key = f"pdf_{pdf_num}_page_{page_num}_full_render"
+                                        all_images[image_key] = rendered_bytes
+                                        page_images.append(image_key)
+                            else:
+                                st.warning(f"Page {page_num} of PDF {pdf_num} produced empty pixmap")
+                        except Exception as e:
+                            st.warning(f"Failed to render page {page_num} as image for PDF {pdf_num}: {str(e)}")
+                            
+                except Exception as e:
+                    st.warning(f"Error processing page {page_num} of PDF {pdf_num}: {str(e)}")
+                    continue
                 
-                for img_index, img in enumerate(image_list):
-                    xref = img[0]
-                    base_image = doc.extract_image(xref)
-                    image_bytes = base_image["image"]
+                # Create text chunks with overlap
+                if page_text:
+                    words = page_text.split()
                     
-                    # Hash the image for deduplication
-                    img_hash = hashlib.md5(image_bytes).hexdigest()
-                    
-                    # Check if this image is a duplicate
-                    if img_hash in image_hashes:
-                        # Image already stored - add a reference to text
-                        original_key = image_hashes[img_hash]
-                        ref_text = f"\n\n[IMAGE_REF: {original_key}] Cross-reference to another image\n\n"
-                        all_text += ref_text
-                        continue
-                    
-                    # Create a normalized identifier for each image
-                    image_key = f"pdf_{i+1}_page_{page_num+1}_img_{img_index+1}"
-                    image_hashes[img_hash] = image_key
-                    all_images[image_key] = image_bytes
-                    has_embedded_images = True
-                    
-                    # Add descriptive image reference to text
-                    surrounding_text = page_text[max(0, len(page_text)//2 - 200):min(len(page_text), len(page_text)//2 + 200)]
-                    image_description = get_image_description(surrounding_text)
-                    
-                    ref_text = f"\n\n[IMAGE: {image_key}] {image_description}\n\n"
-                    all_text += ref_text
-                
-                # Method 2: Only render page as image if no embedded images found
-                if not has_embedded_images:
-                    # If no images found, render the entire page as an image
-                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                    image_bytes = pix.tobytes()
-                    
-                    # Convert to PIL Image and then to bytes in a common format
-                    img = Image.frombytes("RGB", [pix.width, pix.height], image_bytes)
-                    img_byte_arr = io.BytesIO()
-                    img.save(img_byte_arr, format='JPEG')
-                    rendered_bytes = img_byte_arr.getvalue()
-                    
-                    # Hash the rendered page for deduplication
-                    render_hash = hashlib.md5(rendered_bytes).hexdigest()
-                    
-                    # Check if this rendered page is a duplicate
-                    if render_hash not in image_hashes:
-                        # Create a unique identifier
-                        image_key = f"pdf_{i+1}_page_{page_num+1}_full_render"
-                        image_hashes[render_hash] = image_key
-                        all_images[image_key] = rendered_bytes
+                    for chunk_start in range(0, len(words), chunk_size - chunk_overlap):
+                        chunk_end = min(chunk_start + chunk_size, len(words))
+                        if chunk_end - chunk_start < 50:  # Skip tiny chunks
+                            continue
+                            
+                        chunk_text = ' '.join(words[chunk_start:chunk_end])
+                        chunk_id = len(chunks)
+                        chunks.append(chunk_text)
                         
-                        # Add reference to text
-                        ref_text = f"\n\n[IMAGE: {image_key}] Full page render\n\n"
-                        all_text += ref_text
-            
-            # Clean up temporary file
-            os.unlink(pdf_path)
-            
-        except Exception as e:
-            st.error(f"Error processing PDF {i+1}: {str(e)}")
-    
-    return all_text, all_images
-
-def get_image_description(surrounding_text):
-    """Generate image description based on surrounding text"""
-    surrounding_text = surrounding_text.lower()
-    
-    # Look for chart types
-    if any(term in surrounding_text for term in ["chart", "price", "trend", "candlestick"]):
-        return "CHART: Price/Trend visualization"
-    elif any(term in surrounding_text for term in ["momentum", "rsi", "macd", "stochastic"]):
-        return "INDICATOR: Momentum/Technical indicator"
-    elif any(term in surrounding_text for term in ["table", "summary", "comparison"]):
-        return "TABLE: Data summary"
-    elif any(term in surrounding_text for term in ["recommendation", "target", "buy", "sell"]):
-        return "RECOMMENDATION: Investment advice"
-    else:
-        return "Financial visualization"
-
-def normalize_image_reference(reference):
-    """Normalize image references to a standard format"""
-    # Handle [Image X.Y.Z] format
-    new_style_match = re.match(r'\[Image (\d+)\.(\d+)\.(\d+)\]', reference)
-    if new_style_match:
-        pdf_num, page_num, img_num = new_style_match.groups()
-        return f"pdf_{pdf_num}_page_{page_num}_img_{img_num}"
-    
-    # Handle pdf_X_page_Y_img_Z format
-    trad_match = re.match(r'pdf_(\d+)_page_(\d+)_img_(\d+)', reference)
-    if trad_match:
-        return reference  # Already in normalized format
-    
-    # Handle full render format
-    render_match = re.match(r'pdf_(\d+)_page_(\d+)_full_render', reference)
-    if render_match:
-        return reference  # Already in normalized format
-    
-    return None  # Invalid reference
-
-def track_displayed_image(image_ref):
-    """Track that an image has been displayed in this session"""
-    if 'displayed_images_history' not in st.session_state:
-        st.session_state.displayed_images_history = set()
-    
-    # Normalize the reference before tracking
-    normalized_ref = normalize_image_reference(image_ref)
-    if normalized_ref:
-        st.session_state.displayed_images_history.add(normalized_ref)
-
-def was_image_displayed(image_ref):
-    """Check if an image was already displayed in this session"""
-    if 'displayed_images_history' not in st.session_state:
-        return False
-    
-    # Normalize the reference before checking
-    normalized_ref = normalize_image_reference(image_ref)
-    if normalized_ref:
-        return normalized_ref in st.session_state.displayed_images_history
-    
-    return False
-
-def display_image(img_ref, context=None, image_type=None, force=False):
-    """Unified function to display images with tracking and deduplication"""
-    # Skip if already displayed and not forced
-    if was_image_displayed(img_ref) and not force:
-        return False
-    
-    # Normalize the reference
-    normalized_ref = normalize_image_reference(img_ref)
-    if not normalized_ref:
-        st.warning(f"Invalid image reference format: {img_ref}")
-        return False
-    
-    if normalized_ref in st.session_state.pdf_images:
-        img_bytes = st.session_state.pdf_images[normalized_ref]
-        try:
-            image = Image.open(io.BytesIO(img_bytes))
-            
-            # Determine caption based on image type and reference
-            caption = determine_image_caption(normalized_ref, image_type, context)
-            
-            # Display the image
-            st.image(image, caption=caption, use_container_width=True)
-            
-            # Track that this image has been displayed
-            track_displayed_image(normalized_ref)
-            return True
-            
-        except Exception as e:
-            st.error(f"Error displaying image {normalized_ref}: {str(e)}")
-            return False
-    else:
-        st.warning(f"Image not found: {normalized_ref}")
-        return False
-
-def determine_image_caption(img_ref, image_type=None, context=None):
-    """Generate appropriate caption for images"""
-    # Extract components from reference
-    components = re.match(r'pdf_(\d+)_page_(\d+)_(img_(\d+)|full_render)', img_ref)
-    
-    if not components:
-        return f"Image: {img_ref}"
-    
-    pdf_num, page_num = components.group(1), components.group(2)
-    is_full_render = components.group(3) == "full_render"
-    img_num = components.group(4) if not is_full_render else None
-    
-    # Format basic reference info
-    ref_text = f"Image {pdf_num}.{page_num}" + (f".{img_num}" if img_num else " (Full Page)")
-    
-    # If image type is provided, use it
-    if image_type:
-        if image_type == "price_chart":
-            return f"Technical Price Chart: {ref_text}"
-        elif image_type == "momentum":
-            return f"Momentum Indicator: {ref_text}"
-        elif image_type == "recommendation":
-            return f"Recommendation Summary: {ref_text}"
-        elif image_type == "table":
-            return f"Data Table: {ref_text}"
-        else:
-            return f"{image_type.capitalize()}: {ref_text}"
-    
-    # Otherwise try to infer from reference and context
-    if context:
-        context_lower = context.lower()
-        if "price" in context_lower and "chart" in context_lower:
-            return f"Technical Price Chart: {ref_text}"
-        elif any(term in context_lower for term in ["momentum", "rsi", "macd"]):
-            return f"Technical Indicator: {ref_text}" 
-        elif any(term in context_lower for term in ["recommendation", "summary", "target"]):
-            return f"Recommendation Summary: {ref_text}"
-            
-    # Default caption based on location in document
-    if is_full_render:
-        return f"Full Page Render: {ref_text}"
-    elif page_num == "1":
-        return f"Overview: {ref_text}"
-    elif page_num == "2" and img_num == "1":
-        return f"Price Chart: {ref_text}"
-    elif page_num == "2" and img_num == "2":
-        return f"Technical Indicator: {ref_text}"
-    elif page_num == "3" and img_num == "1":
-        return f"Recommendation: {ref_text}"
-    else:
-        return f"Visualization: {ref_text}"
-
-def extract_image_references_from_response(response_text):
-    """Extract all image references from Claude's response"""
-    references = []
-    
-    # Look for [Image X.Y.Z] format
-    new_style_refs = re.findall(r'\[Image (\d+)\.(\d+)\.(\d+)\]', response_text)
-    for pdf_num, page_num, img_num in new_style_refs:
-        normalized_ref = f"pdf_{pdf_num}_page_{page_num}_img_{img_num}"
-        if normalized_ref not in references:
-            references.append(normalized_ref)
-    
-    # Look for pdf_X_page_Y_img_Z format  
-    traditional_refs = re.findall(r'pdf_(\d+)_page_(\d+)_img_(\d+)', response_text)
-    for pdf_num, page_num, img_num in traditional_refs:
-        normalized_ref = f"pdf_{pdf_num}_page_{page_num}_img_{img_num}"
-        if normalized_ref not in references:
-            references.append(normalized_ref)
-            
-    # Look for full page renders
-    render_refs = re.findall(r'pdf_(\d+)_page_(\d+)_full_render', response_text)
-    for pdf_num, page_num in render_refs:
-        normalized_ref = f"pdf_{pdf_num}_page_{page_num}_full_render"
-        if normalized_ref not in references:
-            references.append(normalized_ref)
-            
-    return references
-
-def find_relevant_images(query, available_images):
-    """Find images relevant to a query based on content/location heuristics"""
-    query_lower = query.lower()
-    relevant_images = []
-    
-    # Check for specific image requests
-    if re.search(r'(image|chart|graph|figure|table|visualization)\s+(\d+)\.(\d+)\.(\d+)', query_lower):
-        # User is asking for specific image by number
-        matches = re.findall(r'(image|chart|graph|figure|table|visualization)\s+(\d+)\.(\d+)\.(\d+)', query_lower)
-        for _, pdf_num, page_num, img_num in matches:
-            img_ref = f"pdf_{pdf_num}_page_{page_num}_img_{img_num}"
-            if img_ref in available_images and img_ref not in relevant_images:
-                relevant_images.append(img_ref)
-    
-    # Content-based selection for charts
-    is_price_chart_query = any(term in query_lower for term in 
-                              ["price chart", "price action", "candlestick", "technical chart"])
-    is_momentum_query = any(term in query_lower for term in 
-                          ["momentum", "rsi", "macd", "oscillator", "technical indicator"])
-    is_recommendation_query = any(term in query_lower for term in 
-                                ["recommendation", "rating", "buy signal", "sell signal", "target price"])
-    
-    # If searching for charts, find relevant ones
-    if is_price_chart_query:
-        # Price charts are typically early in document
-        price_charts = [img for img in available_images.keys() 
-                      if re.match(r'pdf_\d+_page_[1-3]_img_\d+', img)]
-        relevant_images.extend([img for img in price_charts if img not in relevant_images])
+                        chunk_metadata.append({
+                            'id': chunk_id,
+                            'pdf_num': pdf_num,
+                            'pdf_name': pdf_file.name,
+                            'page_num': page_num,
+                            'chunk_start': chunk_start,
+                            'chunk_end': chunk_end,
+                            'images': page_images.copy()
+                        })
         
-    if is_momentum_query:
-        # Look for momentum charts (typically page 2, after price chart)
-        momentum_charts = [img for img in available_images.keys() 
-                         if re.match(r'pdf_\d+_page_2_img_[2-4]', img)]
-        relevant_images.extend([img for img in momentum_charts if img not in relevant_images])
-        
-    if is_recommendation_query:
-        # Recommendation charts often near end of document
-        rec_charts = [img for img in available_images.keys() 
-                    if re.match(r'pdf_\d+_page_[3-5]_img_\d+', img)]
-        relevant_images.extend([img for img in rec_charts if img not in relevant_images])
-    
-    return relevant_images
-
-# Main UI logic for handling query responses with images
-def handle_query_response(query, response, images):
-    """Handle display of images based on query and response"""
-    # Extract all image references from response
-    referenced_images = extract_image_references_from_response(response)
-    
-    # Find relevant images based on query content
-    relevant_images = find_relevant_images(query, images)
-    
-    # Combine and deduplicate while maintaining priority (referenced first)
-    all_images_to_display = []
-    for img in referenced_images + relevant_images:
-        if img not in all_images_to_display and img in images:
-            all_images_to_display.append(img)
-    
-    # Display images if found
-    if all_images_to_display:
-        st.write("---")
-        st.subheader("Relevant Visualizations")
-        
-        # Use columns for layout
-        if len(all_images_to_display) > 1:
-            cols = st.columns(min(len(all_images_to_display), 2))
-            for i, img_ref in enumerate(all_images_to_display):
-                with cols[i % 2]:
-                    # Determine image type based on position and query
-                    image_type = None
-                    if "price" in query.lower() and i == 0:
-                        image_type = "price_chart"
-                    elif "momentum" in query.lower() and i <= 1:
-                        image_type = "momentum"
+        finally:
+            # Clean up resources
+            if doc:
+                try:
+                    doc.close()
+                except:
+                    pass
                     
-                    display_image(img_ref, response, image_type)
-        else:
-            # Single image - use full width
-            display_image(all_images_to_display[0], response)
+            # Try to remove temporary file with retry
+            if pdf_path:
+                for _ in range(3):  # Try up to 3 times
+                    try:
+                        os.unlink(pdf_path)
+                        break
+                    except Exception:
+                        time.sleep(0.1)  # Wait briefly before retry
     
-    return all_images_to_display
+    return all_text, all_images, chunks, chunk_metadata
 
-def split_text_into_chunks(text, max_tokens=12000):
-    """Split text into chunks of roughly equal size"""
-    # Simple splitting by paragraphs
-    paragraphs = text.split('\n\n')
-    chunks = []
-    current_chunk = ""
+def create_vector_database(chunks, chunk_metadata):
+    """Create FAISS vector database from text chunks"""
+    if not chunks:
+        st.error("No text chunks found to index")
+        return None, {}
     
-    for paragraph in paragraphs:
-        # Rough token estimate (words / 0.75)
-        paragraph_tokens = len(paragraph.split()) / 0.75
+    # Ensure embedding model is initialized
+    if not st.session_state.embedding_model:
+        if not initialize_embedding_model():
+            st.error("Failed to initialize embedding model")
+            return None, {}
+    
+    # Compute embeddings in batches
+    batch_size = 32
+    all_embeddings = []
+    
+    with st.spinner(f"Creating embeddings for {len(chunks)} chunks..."):
+        for i in range(0, len(chunks), batch_size):
+            batch = chunks[i:min(i+batch_size, len(chunks))]
+            batch_embeddings = st.session_state.embedding_model.encode(batch)
+            all_embeddings.extend(batch_embeddings)
+    
+    # Create FAISS index
+    embedding_dim = len(all_embeddings[0])
+    index = faiss.IndexFlatL2(embedding_dim)
+    
+    # Convert to numpy array and add to index
+    embeddings_array = np.array(all_embeddings).astype('float32')
+    index.add(embeddings_array)
+    
+    # Create mapping dictionary
+    chunk_mapping = {i: {"text": chunks[i], "metadata": chunk_metadata[i]} 
+                     for i in range(len(chunks))}
+    
+    # Save to disk
+    save_dir = "vector_db"
+    os.makedirs(save_dir, exist_ok=True)
+    
+    faiss.write_index(index, f"{save_dir}/pdf_index.faiss")
+    with open(f"{save_dir}/chunk_mapping.pkl", "wb") as f:
+        pickle.dump(chunk_mapping, f)
+    
+    return index, chunk_mapping
+
+def semantic_search(query, k=3):
+    """Search for most relevant chunks using vector similarity"""
+    if not st.session_state.vector_index or not st.session_state.embedding_model:
+        st.error("Vector database not initialized")
+        return []
+    
+    # Encode query
+    query_vector = st.session_state.embedding_model.encode([query]).astype('float32')
+    
+    # Search
+    distances, indices = st.session_state.vector_index.search(query_vector, k)
+    
+    results = []
+    for i, idx in enumerate(indices[0]):
+        if idx < 0:  # FAISS may return -1 for not enough results
+            continue
+            
+        idx = int(idx)
+        chunk_info = st.session_state.chunk_mapping.get(idx)
+        if not chunk_info:
+            continue
+            
+        results.append({
+            "text": chunk_info["text"],
+            "metadata": chunk_info["metadata"],
+            "score": float(distances[0][i])
+        })
+    
+    return results
+
+def query_claude_with_retrieval(query, model="claude-3-sonnet-20240229"):
+    """Query Claude API with semantically retrieved context"""
+    # Get Anthropic client
+    anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not anthropic_api_key:
+        return "Error: Anthropic API key not configured"
         
-        if len(current_chunk.split()) / 0.75 + paragraph_tokens > max_tokens:
-            chunks.append(current_chunk)
-            current_chunk = paragraph
-        else:
-            current_chunk += "\n\n" + paragraph if current_chunk else paragraph
-    
-    if current_chunk:
-        chunks.append(current_chunk)
-    
-    return chunks
-
-def query_claude(query, context, model="claude-3-sonnet-20240229"):
-    """Query Claude API with the query and context"""
-    if not anthropic_client:
-        return "Error: Anthropic client not initialized. Please check your API key."
+    client = anthropic.Anthropic(api_key=anthropic_api_key)
     
     try:
-        system_prompt = """You are a helpful financial analysis assistant that answers questions based ONLY on the provided PDF content.
+        # Perform semantic search
+        results = semantic_search(query, k=5)
+        
+        if not results:
+            return "I couldn't find relevant information in the provided documents. Please try a different question or upload documents with the information you're looking for."
+        
+        # Build context from search results
+        context_parts = []
+        image_references = set()
+        
+        for result in results:
+            # Add text chunk
+            meta = result["metadata"]
+            context_part = f"--- PDF {meta['pdf_num']}, PAGE {meta['page_num']} ---\n{result['text']}"
+            context_parts.append(context_part)
+            
+            # Collect image references
+            for img_ref in meta["images"]:
+                image_references.add(img_ref)
+        
+        # Combine context
+        context = "\n\n".join(context_parts)
+        
+        # Add image references if available
+        if image_references:
+            image_section = "\n\nRelevant images:\n" + "\n".join(
+                f"[Image {ref.split('_')[1]}.{ref.split('_')[3]}.{ref.split('_')[5]}]" 
+                if "img" in ref else f"[Image {ref.split('_')[1]}.{ref.split('_')[3]}.full]"
+                for ref in image_references
+            )
+            context += image_section
+        
+        # System prompt
+        system_prompt = """You are a helpful assistant that answers questions based ONLY on the provided PDF content.
 If the answer isn't in the provided context, say 'I don't find information about this in the provided PDFs.'
 
-IMPORTANT IMAGE HANDLING INSTRUCTIONS FOR FINANCIAL REPORTS:
-1. When referring to images or charts, DO NOT use the format "pdf_X_page_Y_img_Z". 
-   Instead, use the format "[Image X.Y.Z]" where X=pdf number, Y=page number, Z=image number.
+IMPORTANT IMAGE HANDLING INSTRUCTIONS:
+1. When referring to images or charts, use the format "[Image X.Y.Z]" where X=pdf number, Y=page number, Z=image number.
    Example: Use "[Image 1.2.3]" instead of "pdf_1_page_2_img_3"
 
-2. For technical analysis reports, actively identify and reference images that contain:
-   - Price charts (often have candlesticks, trend lines, moving averages)
-   - Momentum indicators (RSI, MACD, etc.)
-   - Performance tables
-   - Recommendation summaries
-   - Technical indicator visualizations
+2. When the user asks about ANY visual element (chart, graph, figure, table, etc.), always reference relevant images 
+   using the [Image X.Y.Z] format.
 
-3. When the user asks about ANY visual element (using terms like "chart", "graph", "figure", "table", "image", 
-   "visualization", "indicator", "momentum score", "price action", "technical analysis"), explicitly list ALL 
-   relevant image references in your response using the [Image X.Y.Z] format.
-
-4. ESPECIALLY IMPORTANT: For any question related to price charts, technical analysis, or indicators, ALWAYS 
-   mention the specific image references where these can be visualized, even if the user doesn't explicitly ask for images.
-
-Example responses specifically for financial reports:
-- "The technical price chart for 4imprint Group is in [Image 1.2.1]. As shown in this chart, the price is above both the 21-day and 50-day moving averages."
-- "I can see several important visualizations in this report: [Image 1.1.1] (main price chart), [Image 1.2.1] (momentum indicator), and [Image 1.3.1] (recommendation summary table)."
-- "The RSI reading of 72.29 is mentioned in the text and visualized in the technical chart [Image 1.2.2]."
-- "According to the analysis in the PDF and the chart in [Image 1.2.1], 4imprint Group is currently trading above its descending trendline."
-
-Give comprehensive, accurate answers based only on the PDF context. When in doubt about a chart or table reference, always include the image reference so the user can see it."""
+Give comprehensive, accurate answers based only on the PDF context."""
         
-        response = anthropic_client.messages.create(
+        # Query Claude
+        response = client.messages.create(
             model=model,
-            max_tokens=4000,
+            max_tokens=1500,
             temperature=0.2,
             system=system_prompt,
             messages=[
                 {"role": "user", "content": f"Context from PDFs:\n\n{context}\n\nQuestion: {query}"}
             ]
         )
+        
+        # Update token usage estimate
+        input_tokens = len(context.split()) * 1.3
+        output_tokens = len(response.content[0].text.split()) * 1.3
+        st.session_state.token_usage += int(input_tokens + output_tokens)
+        
         return response.content[0].text
     except Exception as e:
         return f"Error querying Claude: {str(e)}"
 
-# Continue with the sidebar UI
-with st.sidebar:
-    # File uploader that accepts multiple PDFs
-    uploaded_files = st.file_uploader(
-        "Upload one or more PDF files (up to 500MB each)",
-        type=["pdf"],
-        accept_multiple_files=True
-    )
-    
-    if uploaded_files:
-        if st.button("Process PDFs"):
-            with st.spinner("Extracting text and images from PDFs..."):
-                # Use the enhanced extraction function
-                extracted_text, pdf_images = extract_images_and_text(uploaded_files)
+def display_image(img_ref):
+    """Display an image from the session state"""
+    if img_ref in st.session_state.pdf_images:
+        try:
+            img_bytes = st.session_state.pdf_images[img_ref]
+            image = Image.open(io.BytesIO(img_bytes))
+            
+            # Extract components for caption
+            parts = re.match(r'pdf_(\d+)_page_(\d+)_(img_(\d+)|full_render)', img_ref)
+            if parts:
+                pdf_num, page_num = parts.group(1), parts.group(2)
+                is_full_page = 'full_render' in img_ref
+                img_num = parts.group(4) if not is_full_page else 'full'
+                caption = f"Image {pdf_num}.{page_num}.{img_num}"
+            else:
+                caption = img_ref
                 
-                st.session_state.extracted_text = extracted_text
-                st.session_state.pdf_images = pdf_images
-                st.session_state.chat_history = []
-                st.success(f"Successfully processed {len(uploaded_files)} PDF(s)")
+            st.image(image, caption=caption, use_column_width=True)
+            return True
+        except Exception as e:
+            st.error(f"Error displaying image: {str(e)}")
+            return False
+    else:
+        st.warning(f"Image not found: {img_ref}")
+        return False
 
+def extract_image_references(response_text):
+    """Extract all image references from Claude's response"""
+    images = []
+    
+    # Look for [Image X.Y.Z] format
+    matches = re.findall(r'\[Image (\d+)\.(\d+)\.(\d+|\w+)\]', response_text)
+    for pdf_num, page_num, img_num in matches:
+        if img_num.lower() == 'full':
+            ref = f"pdf_{pdf_num}_page_{page_num}_full_render"
+        else:
+            ref = f"pdf_{pdf_num}_page_{page_num}_img_{img_num}"
+            
+        if ref in st.session_state.pdf_images and ref not in images:
+            images.append(ref)
+    
+    return images
+
+# Title
+st.title("📚 PDF Q&A with Vector Search")
+
+if st.button("Check Local Database"):
+    if os.path.exists("vector_db/pdf_index.faiss"):
+        file_size = os.path.getsize("vector_db/pdf_index.faiss") / (1024 * 1024)  # Size in MB
+        st.success(f"✅ Vector database found locally! Size: {file_size:.2f} MB")
+        st.info(f"Location: {os.path.abspath('vector_db/pdf_index.faiss')}")
+    else:
+        st.error("❌ No local vector database found")
+
+# Sidebar
+with st.sidebar:
+    st.header("Configuration")
+    
+    # API Key input
+    anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not anthropic_api_key:
+        anthropic_api_key = st.text_input("Enter Anthropic API Key", type="password")
+        if anthropic_api_key:
+            os.environ["ANTHROPIC_API_KEY"] = anthropic_api_key
+            st.success("✅ API key set")
+    else:
+        st.success("✅ API key loaded from environment")
+    
     # Model selection
     model = st.selectbox(
         "Select Claude Model",
@@ -501,189 +456,206 @@ with st.sidebar:
             "claude-3-sonnet-20240229", 
             "claude-3-haiku-20240307"
         ],
-        index=0  # Default to 3.5 Sonnet
+        index=0
     )
     
-    # Add token consumption tracker
-    if 'token_usage' not in st.session_state:
-        st.session_state.token_usage = 0
-        
-    st.metric("Estimated Token Usage", st.session_state.token_usage)
+    # PDF upload
+    st.header("Upload Documents")
+    uploaded_files = st.file_uploader(
+        "Upload PDF files",
+        type=["pdf"],
+        accept_multiple_files=True
+    )
+    
+    if uploaded_files:
+        if st.button("Process PDFs"):
+            if not initialize_embedding_model():
+                st.error("Failed to initialize embedding model")
+            else:
+                with st.spinner("Processing PDFs..."):
+                    # Extract text and images
+                    all_text, all_images, chunks, chunk_metadata = extract_text_and_images(uploaded_files)
+                    
+                    # Store in session state
+                    st.session_state.extracted_text = all_text
+                    st.session_state.pdf_images = all_images
+                    
+                    # Create vector database
+                    index, mapping = create_vector_database(chunks, chunk_metadata)
+                    
+                    if index and mapping:
+                        st.session_state.vector_index = index
+                        st.session_state.chunk_mapping = mapping
+                        st.success(f"✅ Processed {len(uploaded_files)} PDF(s) with {len(chunks)} chunks")
+                    else:
+                        st.error("Failed to create vector database")
     
     # Show stats
-    if st.session_state.extracted_text:
-        word_count = len(st.session_state.extracted_text.split())
-        st.info(f"Extracted {word_count} words and {len(st.session_state.pdf_images)} images")
-        st.text(f"Estimated tokens: ~{int(word_count * 1.3)}")
+    if st.session_state.vector_index:
+        st.metric("Vector DB Size", f"{st.session_state.vector_index.ntotal} chunks")
+    
+    if st.session_state.pdf_images:
+        st.metric("Images Extracted", len(st.session_state.pdf_images))
+    
+    st.metric("Estimated Token Usage", st.session_state.token_usage)
 
 # Main chat interface
-if st.session_state.extracted_text:
-    st.subheader("Ask questions about your PDFs")
+# if st.session_state.vector_index and st.session_state.pdf_images:
+#     # Show all images button
+#     if st.button("Show All Images"):
+#         st.header("All Extracted Images")
+        
+#         # Create a multi-column layout
+#         cols = st.columns(2)
+#         for i, (img_ref, _) in enumerate(st.session_state.pdf_images.items()):
+#             with cols[i % 2]:
+#                 display_image(img_ref)
     
-    # Add image gallery button
-    if st.button("Show All Images"):
-        if st.session_state.pdf_images:
-            st.subheader("All Images in Documents")
-            cols = st.columns(2)
-            for i, (img_ref, img_bytes) in enumerate(st.session_state.pdf_images.items()):
-                try:
-                    with cols[i % 2]:
-                        # Use the new display_image function
-                        display_image(img_ref, force=True)
-                except Exception as e:
-                    st.error(f"Could not display image {img_ref}: {str(e)}")
-        else:
-            st.info("No images found in the processed documents.")
+#     # Chat history
+#     for q, a in st.session_state.chat_history:
+#         with st.chat_message("user"):
+#             st.write(q)
+#         with st.chat_message("assistant"):
+#             st.write(a)
+            
+#             # Extract and display referenced images
+#             image_refs = extract_image_references(a)
+#             if image_refs:
+#                 st.write("---")
+#                 for ref in image_refs:
+#                     display_image(ref)
     
-    # Display chat history
-    for i, (q, a) in enumerate(st.session_state.chat_history):
+#     # Query input
+#     query = st.chat_input("Ask a question about your documents:")
+#     if query:
+#         # Display user message
+#         with st.chat_message("user"):
+#             st.write(query)
+        
+#         # Generate and display response
+#         with st.chat_message("assistant"):
+#             response_container = st.empty()
+#             with st.spinner("Generating answer..."):
+#                 response = query_claude_with_retrieval(query, model=model)
+#                 response_container.write(response)
+                
+#                 # Extract and display referenced images
+#                 image_refs = extract_image_references(response)
+#                 if image_refs:
+#                     st.write("---")
+#                     st.subheader("Referenced Images")
+                    
+#                     # Create columns for images
+#                     img_cols = st.columns(min(len(image_refs), 2))
+#                     for i, ref in enumerate(image_refs):
+#                         with img_cols[i % 2]:
+#                             display_image(ref)
+            
+#             # Update chat history
+#             st.session_state.chat_history.append((query, response))
+# else:
+#     st.info("👈 Please upload and process PDF files using the sidebar to get started.")
+
+
+if not st.session_state.vector_index:
+    if load_existing_vector_database():
+        st.success("✅ Loaded existing vector database!")
+        # Show stats
+        st.metric("Vector DB Size", f"{st.session_state.vector_index.ntotal} chunks")
+        st.info("You can start asking questions or upload new PDFs to add to the database")
+    else:
+        st.info("👈 Please upload PDF files using the sidebar to get started.")
+
+# # Main chat interface - only show if we have a vector index
+# if st.session_state.vector_index:
+#     # Chat history
+#     for q, a in st.session_state.chat_history:
+#         with st.chat_message("user"):
+#             st.write(q)
+#         with st.chat_message("assistant"):
+#             st.write(a)
+            
+#     # Query input
+#     query = st.chat_input("Ask a question about your documents:")
+#     if query:
+#         # Display user message
+#         with st.chat_message("user"):
+#             st.write(query)
+        
+#         # Generate and display response
+#         with st.chat_message("assistant"):
+#             response_container = st.empty()
+#             with st.spinner("Generating answer..."):
+#                 response = query_claude_with_retrieval(query, model=model)
+#                 response_container.write(response)
+                
+#                 # Update chat history
+#                 st.session_state.chat_history.append((query, response))
+
+# Main chat interface - only show if we have a vector index
+if st.session_state.vector_index:
+    # Chat history
+    for q, a in st.session_state.chat_history:
         with st.chat_message("user"):
             st.write(q)
         with st.chat_message("assistant"):
             st.write(a)
-    
-    # User query input with chat input
-    query = st.chat_input("Ask a question about your PDFs:")
-    
+            
+            # Add image display for chat history
+            image_refs = extract_image_references(a)
+            if image_refs:
+                st.write("---")
+                st.subheader("Referenced Images")
+                cols = st.columns(min(len(image_refs), 2))
+                for i, ref in enumerate(image_refs):
+                    with cols[i % 2]:
+                        display_image(ref)
+            
+    # Query input
+    query = st.chat_input("Ask a question about your documents:")
     if query:
-        # Add user question to chat history display
+        # Display user message
         with st.chat_message("user"):
             st.write(query)
-            
+        
+        # Generate and display response
         with st.chat_message("assistant"):
-            response_placeholder = st.empty()
-            response_placeholder.markdown("Thinking...")
-            
+            response_container = st.empty()
             with st.spinner("Generating answer..."):
-                # Split the text into manageable chunks
-                chunks = split_text_into_chunks(st.session_state.extracted_text)
+                response = query_claude_with_retrieval(query, model=model)
+                response_container.write(response)
                 
-                # For small documents, just query once
-                if len(chunks) == 1:
-                    final_response = query_claude(query, chunks[0], model=model)
-                    # Estimate token usage
-                    input_tokens = len(chunks[0].split()) * 1.3
-                    output_tokens = len(final_response.split()) * 1.3
-                    st.session_state.token_usage += int(input_tokens + output_tokens)
-                else:
-                    # Query each chunk and combine responses
-                    all_responses = []
-                    input_tokens = 0
-                    
-                    for chunk in chunks:
-                        response = query_claude(query, chunk, model=model)
-                        all_responses.append(response)
-                        input_tokens += len(chunk.split()) * 1.3
-                    
-                    # Combine responses 
-                    synthesis_prompt = f"""
-                    Based on the previous partial analyses of the PDF content, provide a comprehensive 
-                    answer to the question: '{query}'
-                    
-                    Previous analyses:
-                    {'-' * 40}
-                    {''.join(all_responses)}
-                    {'-' * 40}
-                    
-                    Synthesize a complete answer that captures all relevant information from the documents.
-                    """
-                    
-                    final_response = query_claude(
-                        synthesis_prompt, 
-                        "",  # No additional context needed
-                        model=model
-                    )
-                    
-                    # Estimate token usage
-                    output_tokens = len(final_response.split()) * 1.3
-                    synthesis_tokens = len(synthesis_prompt.split()) * 1.3
-                    st.session_state.token_usage += int(input_tokens + output_tokens + synthesis_tokens)
-                
-                # Process Claude's response to find image references
-                # First look for [Image X.Y.Z] style references
-                new_style_pattern = r'\[Image (\d+)\.(\d+)\.(\d+)\]'
-                new_style_matches = re.findall(new_style_pattern, final_response)
-                
-                # Also look for traditional pdf_X_page_Y_img_Z references
-                traditional_pattern = r'pdf_(\d+)_page_(\d+)_img_(\d+)'
-                traditional_matches = re.findall(traditional_pattern, final_response)
-                
-                # Combine all unique references
-                all_references = []
-                for match in new_style_matches + traditional_matches:
-                    pdf_num, page_num, img_num = match
-                    img_ref = f"pdf_{pdf_num}_page_{page_num}_img_{img_num}"
-                    if img_ref not in all_references and img_ref in st.session_state.pdf_images:
-                        all_references.append(img_ref)
-                
-                # Display Claude's response
-                response_placeholder.markdown(final_response)
-                
-                # If we found image references, display buttons
-                if all_references:
+                # Display images referenced in the response
+                image_refs = extract_image_references(response)
+                if image_refs:
                     st.write("---")
                     st.subheader("Referenced Images")
-                    
-                    # Create column layout for buttons
-                    cols = st.columns(min(3, len(all_references)))
-                    
-                    # Create buttons for each reference
-                    for i, img_ref in enumerate(all_references):
-                        # Extract parts from the reference for display
-                        parts = re.match(r'pdf_(\d+)_page_(\d+)_img_(\d+)', img_ref)
-                        if parts:
-                            pdf_num, page_num, img_num = parts.groups()
-                            
-                            # Create button in the appropriate column
-                            with cols[i % len(cols)]:
-                                button_key = f"show_image_{img_ref}_{i}"
-                                if st.button(f"Show Image {pdf_num}.{page_num}.{img_num}", key=button_key):
-                                    # Set selected image and rerun
-                                    st.session_state.selected_image = img_ref
-                                    st.experimental_rerun()
+                    cols = st.columns(min(len(image_refs), 2))
+                    for i, ref in enumerate(image_refs):
+                        with cols[i % 2]:
+                            display_image(ref)
                 
-                # Display selected image if any
-                if 'selected_image' in st.session_state:
-                    selected_ref = st.session_state.selected_image
-                    if selected_ref in st.session_state.pdf_images:
-                        st.write("---")
-                        st.subheader(f"Viewing: {selected_ref}")
-                        
-                        # Use the new display_image function with force=True
-                        if display_image(selected_ref, force=True):
-                            # Add button to hide image
-                            if st.button("Hide Image", key=f"hide_{selected_ref}"):
-                                del st.session_state.selected_image
-                                st.experimental_rerun()
-                
-                # Use the new consolidated handling function
-                handle_query_response(query, final_response, st.session_state.pdf_images)
-            
-            # Add to chat history
-            st.session_state.chat_history.append((query, final_response))
-else:
-    st.info("👈 Please upload PDF files using the sidebar to get started.")
+                # Update chat history
+                st.session_state.chat_history.append((query, response))
 
-# Add enhanced instructions
-with st.expander("Help & Information"):
+
+# Add instructions
+with st.expander("How to use this app"):
     st.markdown("""
-    ### How to use this app:
-    1. Enter your Anthropic API key in the sidebar (if not set in environment variables)
-    2. Upload one or more PDF files using the sidebar
-    3. Click 'Process PDFs' to extract text and images
-    4. Ask questions about the content of your PDFs using the chat interface
-    5. For images/graphs, try queries like "Show me the graph about..." or "What does figure X show?"
+    ### Instructions
+    1. Enter your Anthropic API key if not set in environment variables
+    2. Upload one or more PDF files
+    3. Click 'Process PDFs' to extract text and create vector database
+    4. Ask questions about the content using the chat interface
     
-    ### Features:
-    - Processes both text and images from your PDFs
-    - Maintains chat history for context
-    - Supports all Claude 3 models
-    - Tracks estimated token usage
-    - Handles large documents by splitting into chunks
+    ### Benefits of Vector Search
+    - Much more cost-effective for large documents
+    - Only sends relevant context to the LLM
+    - Faster responses
+    - Works with local embedding model
     
-    ### Tips:
+    ### Tips
     - Be specific in your questions
-    - For multi-page PDFs, you can ask about specific pages
-    - The app works best with searchable PDFs (not scanned documents)
-    - Complex tables and charts may have limited interpretation
+    - Reference specific charts by saying "chart" or "figure"
+    - The app works best with searchable PDFs, not scanned documents
     """)
